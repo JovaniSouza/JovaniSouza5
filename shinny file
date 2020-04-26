@@ -135,7 +135,7 @@ server <- function(input, output) {
     
   values <- reactiveValues(df_data = NULL)
     observeEvent(input$data, {
-       values$df_data <- read.csv(input$data$datapath)
+       values$df_data <- read.csv(input$data$datapath,header=TRUE)
    })
 
    
