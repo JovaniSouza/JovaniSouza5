@@ -1,0 +1,739 @@
+rm(list=ls())
+
+options(shiny.maxRequestSize=60*1024^2)
+
+#bibliotecas
+library(shiny)
+library(shinythemes)
+library(readxl)
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(writexl)
+library(DT)
+library(odbc)
+library(DBI)
+library(dbplyr)
+library(data.table)
+
+
+#conexão com o banco de dados
+con <- DBI::dbConnect(odbc::odbc(),
+                      Driver   = "SQL Server",
+                      Server   = "179.190.21.254",
+                      Database = "RMViewTeste",
+                      UID      = "rmview_demo",
+                      PWD      = "!prd$RM@d3m0",
+                      Port     = 1433)
+
+#função para gerar as previsões
+f1 <- function (Dados_OCUPACAO, idemp,diaescolhido, Codigoescolhido, plot=FALSE, var1, var2, gnum=0,graf=1) {
+  
+  Dados_OCUPACAO$DiaSemana <- weekdays(Dados_OCUPACAO$DataAptoOcupado)
+  
+  Dados_OCUPACAO$DiaTipo[is.na(Dados_OCUPACAO$DiaTipo)] <- 0 
+  
+  selection = startsWith(names(Dados_OCUPACAO), "DayM")
+  
+  Dados_OCUPACAO[selection][is.na(Dados_OCUPACAO[selection])] = 0
+  
+  Dados_PARCIAIS<-subset(Dados_OCUPACAO,Dados_OCUPACAO$DataAptoOcupado<Dados_OCUPACAO$DataAtualizacao)
+
+  dt1 <- as.data.table(Dados_PARCIAIS)
+  
+  cols <- grep("^DayM", colnames(dt1), value = TRUE)
+
+  mediana <- 
+    dt1[, (paste0(cols, "_Pickup")) := DayP1 - .SD, .SDcols = cols
+    ][, lapply(.SD, median), by = .(IdEmpresa, CodigoAgrupador, DiaSemana), .SDcols = paste0(cols, "_Pickup") ]
+
+  
+  Somapickup<-Dados_OCUPACAO%>%
+    inner_join(mediana, by = c('IdEmpresa','CodigoAgrupador', 'DiaSemana')) %>%
+    mutate(across(matches("^DayM\\d+$"), ~.x + 
+                    get(paste0(cur_column(), '_Pickup')),
+                  .names = '{col}_{col}_Pickup')) %>%
+    select(IdEmpresa:CodigoAgrupador, DayM000_DayM000_Pickup:last_col())
+  
+  Somapickup<-data.frame(Somapickup)
+  
+  dataecodigoescolhido <- Dados_OCUPACAO %>%
+    filter(IdEmpresa==idemp,DataAptoOcupado == ymd(diaescolhido), CodigoAgrupador == Codigoescolhido) %>%
+    select(starts_with("DayM")) %>%
+    pivot_longer(cols = everything()) %>%
+    arrange(desc(row_number())) %>%
+    mutate(cs = cumsum(value)) %>%
+    filter(cs == 0) %>%
+    pull(name)
+  (dropnames <- paste0(dataecodigoescolhido,"_",dataecodigoescolhido, "_Pickup"))
+  
+  Somapickup<-Somapickup %>%
+    filter(IdEmpresa==idemp,DataAptoOcupado == ymd(diaescolhido), CodigoAgrupador == Codigoescolhido) %>%
+    select(-any_of(dropnames))
+  
+  if(length(grep("DayM", names(Somapickup))) == 0) {
+    Somapickup[head(dataecodigoescolhido, 20)] <- NA_real_
+  }
+  
+  dados_ajuste<-Somapickup %>%
+    filter(IdEmpresa==idemp,DataAptoOcupado == ymd(diaescolhido)) %>%
+    group_by(CodigoAgrupador) %>%
+    summarize(across(starts_with("DayM"), sum),.groups = 'drop') %>%
+    pivot_longer(cols= -CodigoAgrupador, names_pattern = "DayM(.+)", values_to = "val") %>%
+    mutate(name = readr::parse_number(name))
+  colnames(dados_ajuste)[-1]<-c(var1,var2)
+  dados_ajuste$DiaAntecedente <- dados_ajuste[[as.name(var1)]]
+  dados_ajuste$Numero <- dados_ajuste[[as.name(var2)]]
+  
+  dados_ajuste <- dados_ajuste %>% 
+    group_by(CodigoAgrupador) %>% 
+    slice((ymd(diaescolhido) - min(as.Date(Dados_OCUPACAO$DataAtualizacao) [
+      Dados_OCUPACAO$CodigoAgrupador == first(CodigoAgrupador)])):max(DiaAntecedente)+1) %>%
+    ungroup
+  
+  dados_ajuste$Numero[is.na(dados_ajuste$Numero)] <- 0 
+
+  #média historica
+  m<-Dados_PARCIAIS%>%
+    group_by(IdEmpresa,CodigoAgrupador,DiaSemana) %>%
+    summarize(across(starts_with("DayP1"), mean),.groups = 'drop')
+  m<-subset(m, IdEmpresa==idemp & DiaSemana == Dados_OCUPACAO$DiaSemana[match(ymd(diaescolhido), as.Date(Dados_OCUPACAO$DataAptoOcupado))] & CodigoAgrupador == Codigoescolhido)$DayP1
+  
+  if (nrow(dados_ajuste)<=2){
+    m
+    var<-as.numeric(m)
+  }
+  
+  else if(any(table(dados_ajuste$Numero) >= 3)& length(unique(dados_ajuste$Numero)) == 1){
+    yz <- unique(dados_ajuste$Numero)
+    var<-as.numeric(yz)
+  }
+  
+  else  {
+    
+    model <- lm(Numero ~ I(DiaAntecedente^2), dados_ajuste)
+    coef<-max(coef(model)[1], 0)
+    var<-as.numeric(coef)
+    
+  }
+  
+  
+  if(plot){
+    maxalcance <-  range(min(0, dados_ajuste$Numero, na.rm = TRUE))
+    maxalcance[2] <- if(all(dados_ajuste$Numero==0, na.rm=TRUE)) m+100 else max(dados_ajuste$Numero)+ 100
+    if (gnum)  maxalcance[2] <-  maxalcance[2] + 300 
+    max<-if(all(dados_ajuste$Numero==0, na.rm=TRUE)) m+1 else max(0,dados_ajuste$DiaAntecedente, na.rm = TRUE)+1
+    limx = c(0,max)
+    limy = c(0,maxalcance[2])
+    
+    if (graf==1){
+      if (nrow(dados_ajuste)<=2) {leg = round(m,1)
+      } 
+      
+      else if(any(table(dados_ajuste$Numero) >= 3)& length(unique(dados_ajuste$Numero)) == 1){leg= round(yz,1)
+      }
+      
+      else {leg = round(coef,1)
+      }
+      
+      title = "O número esperado de reservas é:"
+    } else if (graf==2){
+      if (nrow(dados_ajuste)<=2) {leg = paste('R$', round(m,1))
+      } 
+      
+      else if(any(table(dados_ajuste$Numero) >= 3)& length(unique(dados_ajuste$Numero)) == 1){leg= paste('R$',round(yz,1))}
+      
+      else {leg = paste('R$',round(coef,1))}
+      
+      title = " A diária média prevista é:"
+    }
+    
+    diaescolhido<-paste(rev(unlist(strsplit(diaescolhido, "-", fixed = TRUE))), collapse = "/")
+    
+    plot(Numero ~ DiaAntecedente,  xlim= limx, ylim= limy, xlab = var1, ylab=var2,
+         xaxs='i',data = dados_ajuste,cex=1.5,cex.lab=1.5,cex.axis=1.5, cex.main=1.5, cex.sub=2, lwd=2.5, main = paste0(diaescolhido, "-", Codigoescolhido))
+    
+    legend("topright",  legend= leg,title=title,title.col = "black", cex = 1.2)
+    
+    if (nrow(dados_ajuste)<=2){
+      abline(h=m,lwd=2) 
+      points(0, m, col = "red", pch = 19, cex = 2, xpd = TRUE)
+      text(.1,m+ .5, round(m,1), cex=1.5,pos=4,offset =1,col="black")
+    }
+    
+    else if(any(table(dados_ajuste$Numero) >= 3)& length(unique(dados_ajuste$Numero)) == 1){
+      lines(c(0,dados_ajuste$DiaAntecedente), c(yz, dados_ajuste$Numero), lwd = 2)
+      points(0, yz, col = "red", pch = 19, cex = 2, xpd = TRUE)
+      text(.1,yz+ .5,round(yz,1), cex=1.5,pos=4,offset =1,col="black")
+    }
+    
+    else  {
+      new.data <- data.frame(DiaAntecedente = with(dados_ajuste, seq(min(DiaAntecedente),max(DiaAntecedente),len = 45)))
+      new.data <- rbind(0, new.data)
+      lines(new.data$DiaAntecedente,predict(model,newdata = new.data),lwd=2)
+      points(0, coef, col="red",pch=19,cex = 2,xpd=TRUE)
+      text(.99,coef + 1,max(0, round(coef,1)), cex=1.5,pos=4,offset =1,col="black")
+    }
+    
+  }
+  return(var)
+}
+
+ui <- fluidPage(
+  
+  ui <- shiny::navbarPage(theme = shinytheme("flatly"), collapsible = TRUE,
+                          br(),
+                          
+                          tabPanel("Previsão por período",
+                                   fluidPage(
+                                     fluidRow(
+                                       br(), br(),
+                                       column(4,
+                                              wellPanel(
+                                                radioButtons("buttonDataSource", 
+                                                             label = h3("Fonte de dados"),
+                                                             choices = list("Arquivo" = "arquivo", "Banco de dados" = "banco"), 
+                                                             selected = "Arquivo"),
+                                                uiOutput('fileInput'),
+                                                
+                                                conditionalPanel(
+                                                  condition = "output.fileUploaded == true || input.buttonDataSource == 'banco'",
+                                                  uiOutput("daterange"),
+                                                  actionButton("exibir", "Exibir resultados na tela"),
+                                                  br(),br(),
+                                                  downloadButton("download", "Fazer download de resultados"),
+                                                  br(),br(),
+                                                  actionButton("reset1", "Limpar tela")
+                                                ))),
+                                       
+                                       column(8,
+                                              tabsetPanel(
+                                                tabPanel("Reservas", dataTableOutput('tabela')),
+                                                tabPanel("Diária Média", dataTableOutput('tabela2')),
+                                                tabPanel("Tempo de permanência",dataTableOutput('tabela3')), 
+                                                tabPanel("No Show",dataTableOutput('tabela4'))
+                                                
+                                                
+                                              ))
+                                     ))),
+                          
+                          tabPanel("Previsão por dia",
+                                   fluidPage(
+                                     fluidRow(
+                                       br(), br(),
+                                       column(4,
+                                              conditionalPanel(
+                                                condition = "output.fileUploaded == true || input.buttonDataSource == 'banco'",
+                                                wellPanel(
+                                                  uiOutput("date"),
+                                                  uiOutput("id"),
+                                                  uiOutput("mycode"),
+                                                  
+                                                  conditionalPanel(
+                                                    condition = "output.mycode",
+                                                    actionButton("reset2", "Limpar tela"))
+                                                  
+                                                  
+                                                ))),
+                                       
+                                       column(8,
+                                              tabsetPanel(
+                                                tabPanel("Reservas", plotOutput("grafico",width = "100%", height = "600")),
+                                                tabPanel("Diária Média", plotOutput("grafico2",width = "100%", height = "600"))
+                                                
+                                              )
+                                       )
+                                     )
+                                   ))))
+
+server <- function(input, output,session) {
+  
+  rv <- reactiveValues(data=NULL, data2=NULL,data3=NULL,data4=NULL)
+  
+  output$fileInput <- renderUI({
+    ib <-  req(input$buttonDataSource)
+    if(ib=="arquivo"){
+           
+        fileInput("file",h4("Importar arquivo"),
+                  multiple = T,accept = ".xlsx",
+                  placeholder = "Nenhum arquivo selecionado")
+     } else {
+        NULL
+      }
+  })
+
+  data <- reactive({
+    ib<-req(input$buttonDataSource)
+    if (ib=="arquivo") {
+    
+    if (is.null(input$file)) {
+      return(NULL)
+    }
+    else {
+      df1 <- read_excel(input$file$datapath,"APTOS OCUPADOS")
+      df1<-df1 %>% filter(GeraInformacoes != 0)
+      df1<- df1 %>% mutate(across(starts_with("Day"), as.numeric))
+      validate(need(all(c('DataAtualizacao', 'DataAptoOcupado') %in% colnames(df1)), "Arquivo incorreto"))
+      df1 <- df1 %>% mutate_if(~inherits(., what = "POSIXct"), ymd) 
+      df1<-df1 %>% 
+        arrange(IdEmpresa, DataAptoOcupado)
+      return(df1)
+    }}
+  
+    
+    else if (input$buttonDataSource=="banco") {
+      
+      showModal(modalDialog("Aguarde alguns instantes...", footer=NULL))
+      on.exit(removeModal())
+
+      df1<-tbl(con, in_schema("dbo", "ApartamentosOcupados")) %>%
+        filter(GeraInformacoes != 0) %>% 
+        mutate(across(starts_with("Day"), as.numeric)) %>% 
+        collect()
+      
+      df1<-df1 %>% mutate(DiaSemana=str_replace(DiaSemana, "-.*", "")%>%
+                            str_replace("S�bado", "Sabado")%>%
+                            str_replace("Ter�a", "Terça"))
+      
+      df1<-df1 %>% 
+        arrange(IdEmpresa, DataAptoOcupado)
+
+      return(df1)
+
+    }   
+  })
+  
+  
+  data2 <- reactive({
+    ib<-req(input$buttonDataSource)
+   
+    if (ib=="arquivo") {
+    req(input$file) 
+    
+    df2 <- read_excel(input$file$datapath,"DIÁRIA")
+    df2<-df2 %>% filter(GeraInformacoes != 0)
+    df2<- df2 %>% mutate(across(starts_with("Day"), as.numeric))
+    
+    }    else  {
+      
+      showModal(modalDialog("Aguarde alguns instantes...", footer=NULL))
+      on.exit(removeModal())
+      
+      df2<- tbl(con, in_schema("dbo", "Diaria")) %>% 
+       filter(GeraInformacoes != 0) %>% 
+       mutate(across(starts_with("Day"), as.numeric)) %>%
+       collect()
+     
+     df2<-df2 %>% mutate(DiaSemana=str_replace(DiaSemana, "-.*", "")%>%
+                           str_replace("S�bado", "Sabado")%>%
+                           str_replace("Ter�a", "Terça"))
+     
+     df2<-df2 %>% 
+       arrange(IdEmpresa, DataAptoOcupado)
+    } 
+  })
+  
+  
+  data3 <- reactive({
+    ib<-req(input$buttonDataSource)
+    
+    if (ib=="arquivo") {
+    req(input$file) 
+    df3 <- read_excel(input$file$datapath,"TEMPO PERMANÊNCIA")
+    df3<-df3 %>% mutate(DiaSemana=str_replace(DiaSemana, "-.*", "")%>%
+                          str_replace("Sábado", "Sabado"))
+    } else {
+      showModal(modalDialog("Aguarde alguns instantes...", footer=NULL))
+      on.exit(removeModal())
+      
+      df3 <- tbl(con, in_schema("dbo", "TempoPermanencia")) %>% collect()
+      
+      df3<-df3 %>% mutate(DiaSemana=str_replace(DiaSemana, "-.*", "")%>%
+                            str_replace("S�bado", "Sabado")%>%
+                            str_replace("Ter�a", "Terça"))
+      df3<-df3 %>% 
+        arrange(IdEmpresa, DataCheckin)
+    }
+  })
+  
+  data4 <- reactive({
+    
+    ib<-req(input$buttonDataSource)
+
+    if (ib=="arquivo") {
+    req(input$file) 
+    df4 <- read_excel(input$file$datapath,"NO SHOW")
+    df4<-df4 %>% mutate(DiaSemana=str_replace(DiaSemana, "-.*", "")%>%
+                          str_replace("Sábado", "Sabado"))
+    } else{
+      showModal(modalDialog("Aguarde alguns instantes...", footer=NULL))
+      on.exit(removeModal())
+      
+      df4 <- tbl(con, in_schema("dbo", "NoShow")) %>% collect()
+      df4<-df4 %>% mutate(DiaSemana=str_replace(DiaSemana, "-.*", "")%>%
+                            str_replace("S�bado", "Sabado")%>%
+                            str_replace("Ter�a", "Terça"))
+      df4<-df4 %>% 
+        arrange(IdEmpresa, DataCheckin)
+    }
+  })
+  
+  sheetnames <- eventReactive(input$file, {
+    available_sheets = openxlsx::getSheetNames(input$file$datapath)
+  })
+  
+  
+  output$fileUploaded <- reactive({
+    return(!is.null(rv$data))
+  })
+  outputOptions(output, 'fileUploaded', suspendWhenHidden=FALSE)
+  
+  
+  output$date <- renderUI({
+    req(rv$data)
+    data <- rv$data
+    sub_Dados_OCUPACAO <- subset(data, as.Date(DataAptoOcupado) >= as.Date(DataAtualizacao))
+    all_dates <- seq(as.Date('2021-01-01'), as.Date('2021-01-15'), by = "day")
+    disabled <- as.Date(setdiff(all_dates, as.Date(data$DataAptoOcupado)), origin = "1970-01-01")
+    datadeentrada<- dateInput(input = "DataAptoOcupado", 
+                              label = h4("Escolha uma data"),
+                              min = min(sub_Dados_OCUPACAO$DataAptoOcupado),
+                              max = max(sub_Dados_OCUPACAO$DataAptoOcupado),
+                              value = as.Date('2020-01-15'),
+                              format = "dd-mm-yyyy",
+                              datesdisabled = disabled)
+    datadeentrada$children[[2]]$attribs$placeholder <- "Nenhuma data selecionada"
+    datadeentrada
+  })
+  
+  output$id <- renderUI({
+    req(input$DataAptoOcupado,rv$data)
+    Dados_OCUPACAO <- rv$data
+    df2 <- Dados_OCUPACAO[as.Date(Dados_OCUPACAO$DataAptoOcupado) %in% input$DataAptoOcupado,]
+    selectInput("idemp", label = h4("Id Empresa"),choices=c("Nenhum id selecionado" = "", sort(unique(df2$IdEmpresa))))
+  })
+  
+  output$mycode <- renderUI({
+    req(input$DataAptoOcupado,input$idemp,rv$data)
+    Dados_OCUPACAO <- rv$data
+    df2 <- Dados_OCUPACAO[as.Date(Dados_OCUPACAO$DataAptoOcupado) %in% input$DataAptoOcupado & input$idemp == Dados_OCUPACAO$IdEmpresa, ]
+    selectInput("code", label = h4("Código Agrupador"),choices=c("Nenhum código selecionado" = "", sort(unique(df2$CodigoAgrupador))))
+  })
+  
+  output$grafico <- renderPlot({
+    req(input$DataAptoOcupado,input$idemp,input$code,rv$data)
+    if (input$idemp=="") return(NULL)
+    if (input$code=="") return(NULL)
+    var1 = "Dias antecedentes à reserva"
+    var2 = "Número de reservas"
+    f1(rv$data,as.character(input$idemp),as.character(input$DataAptoOcupado),as.character(input$code),plot=TRUE,var1,var2,graf=1)})
+  
+  output$grafico2 <- renderPlot({
+    req(input$DataAptoOcupado,input$idemp,input$code,rv$data2)
+    if (input$idemp=="") return(NULL)
+    if (input$code=="") return(NULL)
+    var1 = "Dias antecedentes à reserva"
+    var2 = "Diária média"
+    f1(rv$data2,as.character(input$idemp),as.character(input$DataAptoOcupado),as.character(input$code),plot=TRUE,var1,var2,1,graf=2)})
+  
+  
+  output$daterange <- renderUI({
+    req(rv$data)
+    data <- rv$data
+    tagList(dateRangeInput("daterange1", "Se você deseja ver a previsão de reserva e diária média entre um período, basta selecionar a data de início e a data de término:",
+                           min   = min(data$DataAtualizacao),
+                           max   = max(data$DataAptoOcupado),
+                           start  = as.Date("2020-01-01"),
+                           end    = as.Date("2020-12-31"),
+                           format = "dd-mm-yyyy"),
+            
+            tags$script(HTML('
+                setTimeout(function(){
+                  $("#daterange1 input")[0].value = "Nenhuma data selecionada";
+                  $("#daterange1 input")[1].value = "Nenhuma data selecionada";
+                }, 50);
+            ')))
+  })
+  
+  observe({
+    rv$data <- data()
+    rv$data2 <- data2()
+    rv$data3 <- data3()
+    rv$data4 <- data4()
+  })
+  
+   data_subset <- reactive({
+    req(input$daterange1, rv$data)
+    req(input$daterange1[1] <= input$daterange1[2])
+    var1 = "Dias antecedentes à reserva"
+    var2 = "Número de reservas"
+    showModal(modalDialog("Aguarde alguns instantes...", footer=NULL))
+    on.exit(removeModal())
+    days <- seq(input$daterange1[1], input$daterange1[2], by = 'day')
+    Dados_OCUPACAO <- subset(rv$data, as.Date(DataAptoOcupado) %in% days)
+    Datas <- subset(Dados_OCUPACAO, DataAptoOcupado >= DataAtualizacao)
+    df2 <- Datas %>% select(IdEmpresa,DataAptoOcupado,CodigoAgrupador)
+    Todos <- cbind(df2, Previsao = apply(df2, 1, function(x) {f1(rv$data,as.numeric(x[1]),as.Date(x[2]),x[3],plot=FALSE,var1,var2)}))
+    Todos$Previsao[Todos$Previsao < 0] <- 0
+    Todos<-Todos %>% mutate(across(4:last_col(), ~round(.x))) 
+    Todos<-tidyr::pivot_wider(Todos, names_from = CodigoAgrupador, values_from = Previsao)
+    Todos<-Todos %>% mutate(DataAptoOcupado = format(ymd(DataAptoOcupado), "%d/%m/%Y"),
+                            TOTAL = rowSums(across(3:last_col()), na.rm = TRUE),  
+                            across(everything(), ~ replace_na(as.character(.), '-')))
+  })
+  
+  data_aptoprevisao <- reactive({
+    req(input$daterange1, rv$data)
+    req(input$daterange1[1] <= input$daterange1[2])
+    var1 = "Dias antecedentes à reserva"
+    var2 = "Número de reservas"
+    showModal(modalDialog("Aguarde alguns instantes...", footer=NULL))
+    on.exit(removeModal())
+    days <- seq(input$daterange1[1], input$daterange1[2], by = 'day')
+    Dados_OCUPACAO <- subset(rv$data, as.Date(DataAptoOcupado) %in% days)
+    Datas <- subset(Dados_OCUPACAO, DataAptoOcupado >= DataAtualizacao)
+   
+    Todos<-Datas%>%
+     transmute(
+        IdEmpresa,DataAptoOcupado, CodigoAgrupador,
+        Previsao = mapply(f1, list(rv$data), IdEmpresa,as.Date(DataAptoOcupado), CodigoAgrupador, plot=FALSE, var1 , var2))
+    
+    Todos$Previsao[Todos$Previsao < 0] <- 0
+    
+     Todos<-Dados_OCUPACAO %>%
+     left_join(Todos, by = c("IdEmpresa","DataAptoOcupado", "CodigoAgrupador")) %>%
+     select(-c(DiaSemana, DiaTipo, GeraInformacoes,DayP1)) %>%
+     mutate(across(starts_with("Day"), ~ Previsao - .),
+     across(contains("Data"), ymd),
+     datedif = parse_number(as.character(DataAptoOcupado-DataAtualizacao))) %>%
+     rename_with(~str_replace(.,'(?<=[A-Z])0+(?=.)', ""),starts_with('Day')) %>%
+     rowwise %>%
+     mutate(Pickup= if (str_c('DayM', datedif) %in% names(.)) get(str_c('DayM', datedif)) else Previsao) %>%
+     ungroup() %>%
+     select(IdEmpresa,DataAptoOcupado, CodigoAgrupador, Previsao, Pickup)%>%
+     mutate(across(4:last_col(), ~round(.x)))%>%
+     mutate(DataAptoOcupado = format(ymd(DataAptoOcupado), "%d/%m/%Y"))
+     
+     Todos<-Todos%>%
+       mutate(Pickup = case_when(is.na(Pickup) ~ as.numeric(Previsao), Pickup == "" ~ as.numeric(Previsao),
+                                   TRUE ~ Pickup))
+  })
+  
+  
+  data_subset2 <- reactive({
+    req(input$daterange1, rv$data2)
+    req(input$daterange1[1] <= input$daterange1[2])
+    var1 = "Dias antecedentes à reserva"
+    var2 = "Diária média"
+    showModal(modalDialog("Aguarde alguns instantes...", footer=NULL))
+    on.exit(removeModal())
+    days <- seq(input$daterange1[1], input$daterange1[2], by = 'day')
+    Dados_OCUPACAO <- subset(rv$data2, as.Date(DataAptoOcupado) %in% days)
+    Datas <- subset(Dados_OCUPACAO, DataAptoOcupado >= DataAtualizacao)
+    df2 <- Datas %>% select(IdEmpresa,DataAptoOcupado,CodigoAgrupador)
+    Todos <- cbind(df2, Previsao = apply(df2, 1, function(x) {f1(rv$data2,as.numeric(x[1]),as.Date(x[2]),x[3],plot=FALSE,var1,var2)}))
+    Todos$Previsao[Todos$Previsao < 0] <- 0
+    Todos<-tidyr::pivot_wider(Todos, names_from = CodigoAgrupador, values_from = Previsao)
+    Todos<-Todos %>% mutate(DataAptoOcupado = format(ymd(DataAptoOcupado), "%d/%m/%Y"),
+                            TOTAL = rowSums(across(3:last_col()), na.rm = TRUE),
+                            across(3:last_col(), ~ifelse(is.na(.x), "-", sprintf("R$%.2f", .x))))
+  })
+  
+  data_diaria <- reactive({
+    req(input$daterange1, rv$data2)
+    req(input$daterange1[1] <= input$daterange1[2])
+    var1 = "Dias antecedentes à reserva"
+    var2 = "Diária média"
+    showModal(modalDialog("Aguarde alguns instantes...", footer=NULL))
+    on.exit(removeModal())
+    days <- seq(input$daterange1[1], input$daterange1[2], by = 'day')
+    Dados_OCUPACAO <- subset(rv$data2, as.Date(DataAptoOcupado) %in% days)
+    Datas <- subset(Dados_OCUPACAO, DataAptoOcupado >= DataAtualizacao)
+  
+    Todos<-Datas%>%
+      transmute(
+        IdEmpresa,DataAptoOcupado, CodigoAgrupador,
+        Previsao = mapply(f1, list(rv$data2), IdEmpresa,as.Date(DataAptoOcupado), CodigoAgrupador, plot=FALSE, var1 , var2))
+
+        Todos$Previsao[Todos$Previsao < 0] <- 0
+    
+    Todos<-Dados_OCUPACAO %>%
+      left_join(Todos, by = c("IdEmpresa","DataAptoOcupado", "CodigoAgrupador")) %>%
+      select(-c(DiaSemana, DiaTipo, GeraInformacoes,DayP1)) %>%
+      mutate(across(starts_with("Day"), ~ Previsao - .),
+             across(contains("Data"), ymd),
+             datedif = parse_number(as.character(DataAptoOcupado-DataAtualizacao))) %>%
+      rename_with(~str_replace(.,'(?<=[A-Z])0+(?=.)', ""),starts_with('Day')) %>%
+      rowwise %>%
+      mutate(Pickup= if (str_c('DayM', datedif) %in% names(.)) get(str_c('DayM', datedif)) else Previsao) %>%
+      ungroup() %>%
+      select(IdEmpresa,DataAptoOcupado, CodigoAgrupador, Previsao, Pickup)
+
+        Todos<-Todos%>%
+      mutate(Pickup = case_when(is.na(Pickup) ~ as.numeric(Previsao), Pickup == "" ~ as.numeric(Previsao),
+                                TRUE ~ Pickup))
+    
+    Todos<-Todos %>% mutate(across(4:last_col(), ~ sub(".", ",", sprintf("%0.2f", .x), fixed = TRUE)),
+                            DataAptoOcupado = format(ymd(DataAptoOcupado), "%d/%m/%Y"))
+  
+  })
+  
+  
+  ajustedia <- data.frame(
+    Diabase = c("Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sabado", "Domingo"),
+    Diasistema = c("segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"), #para gerar corretamente no servidor Shiny
+    Diasistema2 = c("segunda-feira", "terça-feira", "quarta-feira", "quinta-feira","sexta-feira", "sábado", "domingo") #para gerar corretamente no Rstudio
+  )
+  
+  
+  data_tempop <- reactive({
+    req(input$daterange1,rv$data3)
+    req(input$daterange1[1] <= input$daterange1[2])
+    showModal(modalDialog("Aguarde alguns instantes...", footer=NULL))
+    on.exit(removeModal())
+    days <- seq(input$daterange1[1], input$daterange1[2], by = 'day')
+    Dados_OCUPACAO <- dplyr::filter(rv$data3, DataAtualizacao %in% days)
+    
+    Semanasistema <- unique(weekdays(days)) 
+    
+    wk <- ajustedia %>% 
+      mutate(WeekPrS = if (sum(ajustedia$Diasistema %in% Semanasistema) == length(Semanasistema)) Diasistema else{
+        if (sum(ajustedia$Diasistema2 %in% Semanasistema) == length(Semanasistema)) Diasistema2 else Diabase})%>%
+      select(-Diasistema, -Diasistema2)
+    
+    smna <- wk[wk$WeekPrS%in% Semanasistema,]
+    
+    smna_dia <- smna$Diabase
+    
+    nms <- c('TempoPermanencia|TempoPermanência|TempoPermanÃªncia')
+    
+    mediaTempo <- rv$data3 %>%
+      group_by(IdEmpresa,DiaSemana = tools::toTitleCase(DiaSemana), CodigoAgrupador,DiaTipo) %>% 
+      summarise(across(matches(nms), mean, .names = 'TempoPermanencia',na.rm = TRUE), .groups = 'drop')
+    
+    
+    mediaTempo <- transform(mediaTempo, TempoPermanencia = format(round(TempoPermanencia, digits = 2), nsmall = 2))
+    mediaTempo <- mediaTempo[mediaTempo$DiaSemana %in% as.character(smna_dia),]
+    
+    left_join(mediaTempo, wk, by = c("DiaSemana" = "Diabase")) %>%      
+      arrange(match(WeekPrS,weekdays(seq(input$daterange1[1], input$daterange1[2], by = "day")))) %>%
+      select(-WeekPrS)
+  })
+  
+  
+  
+  data_noshow <- reactive({
+    req(input$daterange1, rv$data4)
+    req(input$daterange1[1] <= input$daterange1[2])
+    showModal(modalDialog("Aguarde alguns instantes...", footer=NULL))
+    on.exit(removeModal())
+    days <- seq(input$daterange1[1], input$daterange1[2], by = 'day')
+    Dados_OCUPACAO <- dplyr::filter(rv$data4, DataAtualizacao %in% days)
+    
+    Semanasistema <- unique(weekdays(days)) 
+    
+    wk <- ajustedia %>% 
+      mutate(WeekPrS = if (sum(ajustedia$Diasistema2 %in% Semanasistema) == length(Semanasistema)) Diasistema2 else Diasistema) %>% 
+      select(-Diasistema, -Diasistema2)
+    smna <- wk[wk$WeekPrS%in% Semanasistema,]
+    
+    smna_dia <- smna$Diabase
+    
+    statmod <- function(x) {
+      z <- table(as.vector(x))
+      names(z)[z == max(z)]}
+    
+    nms <- c('Noshow|NoShow')
+    
+    temp_noshow<-rv$data4%>%
+      group_by(IdEmpresa,DiaSemana = tools::toTitleCase(DiaSemana),DiaTipo) %>%
+      summarize(NoShow=statmod(across(matches(nms))),.groups = 'drop')
+    
+    temp_noshow <- temp_noshow[temp_noshow$DiaSemana %in% as.character(smna_dia),]
+    
+    temp_noshow <-temp_noshow %>% 
+      group_by(IdEmpresa,DiaSemana,DiaTipo) %>% 
+      slice_max(n = 1, order_by = NoShow)
+    
+    left_join(temp_noshow, wk, by = c("DiaSemana" = "Diabase")) %>%      
+      arrange(match(WeekPrS,weekdays(seq(input$daterange1[1], input$daterange1[2], by = "day")))) %>%
+      select(-WeekPrS)
+  })
+  
+  observeEvent(input$exibir, {  
+    req(rv$data)
+ 
+    output$tabela <- renderDataTable({
+      
+      datatable (data_subset(),options = list(columnDefs = list(list(className = 'dt-center', targets = "_all")),
+                                              paging =TRUE,searching = FALSE, pageLength =  10,dom = 'tip',scrollX=TRUE),
+                 rownames = FALSE) 
+    })
+    
+    output$tabela2 <- renderDataTable({
+      datatable (data_subset2(),options = list(columnDefs = list(list(className = 'dt-center', targets = "_all")),
+                                               paging =TRUE,searching = FALSE, pageLength =  10,dom = 'tip',scrollX=TRUE),
+                 rownames = FALSE) 
+    })
+    
+    
+    
+    output$tabela3 <- renderDataTable({
+      datatable (data_tempop(),options = list(columnDefs = list(list(className = 'dt-center', targets = "_all")),
+                                              paging =TRUE,searching = FALSE, pageLength =  10,dom = 'tip',scrollX=TRUE),
+                 rownames = FALSE) 
+    })
+    
+    
+    output$tabela4 <- renderDataTable({
+      datatable (data_noshow(),options = list(columnDefs = list(list(className = 'dt-center', targets = "_all")),
+                                              paging =TRUE,searching = FALSE, pageLength =  10,dom = 'tip',scrollX=TRUE),
+                 rownames = FALSE) 
+    })
+    
+  })
+  
+  adddataatual <- function(DATA){
+    tmpTbl <- DATA
+    tmpTbl$Data_Atualizacao<- format(Sys.Date(), "%d/%m/%Y")
+    nCols <- ncol(tmpTbl)
+    return(tmpTbl[, c(nCols, seq_len(nCols-1))])
+  }
+  
+  
+  output$download <- downloadHandler(
+    filename = function() {"data.xlsx"},
+    content = function(file) {
+      Previsao1_Aptos<-adddataatual(data_aptoprevisao())   %>%relocate(IdEmpresa)
+      Previsao2_Diaria<-adddataatual(data_diaria())    %>%relocate(IdEmpresa)
+      Previsao3_TempoPermanencia<-adddataatual(data_tempop())  %>%relocate(IdEmpresa)
+      Previsao4_NoShow<-adddataatual(data_noshow())  %>%relocate(IdEmpresa)
+      sheets <- mget(ls(pattern = "Previsao")) 
+      writexl::write_xlsx(sheets, path = file) 
+    }
+  )
+  
+  observeEvent(input$reset1, {
+    req(rv$data)
+    rv$data <- NULL
+    rv$data2 <- NULL
+    rv$data3 <- NULL
+    rv$data4 <- NULL
+    
+    
+    output$fileInput <- renderUI({
+      fileInput("file",h4("Importar arquivo"),
+                multiple = T,accept = ".xlsx",
+                placeholder = "Nenhum arquivo selecionado")
+    })
+  })
+  
+  observeEvent(input$reset2, {
+    updateDateInput(session, 'DataAptoOcupado', value = NA)
+    
+  })
+  
+  
+}
+
+shinyApp(ui = ui, server = server)
